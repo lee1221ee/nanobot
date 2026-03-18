@@ -6,9 +6,9 @@ from pathlib import Path
 from typing import Any, Literal
 
 import httpx
-from pydantic import Field
 import websockets
 from loguru import logger
+from pydantic import Field
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
@@ -31,6 +31,7 @@ class DiscordConfig(Base):
     gateway_url: str = "wss://gateway.discord.gg/?v=10&encoding=json"
     intents: int = 37377
     group_policy: Literal["mention", "open"] = "mention"
+    reply_in_thread: bool = True
 
 
 class DiscordChannel(BaseChannel):
@@ -54,6 +55,7 @@ class DiscordChannel(BaseChannel):
         self._typing_tasks: dict[str, asyncio.Task] = {}
         self._http: httpx.AsyncClient | None = None
         self._bot_user_id: str | None = None
+        self._known_threads: set[str] = set()
 
     async def start(self) -> None:
         """Start the Discord gateway connection."""
@@ -67,6 +69,7 @@ class DiscordChannel(BaseChannel):
         while self._running:
             try:
                 logger.info("Connecting to Discord gateway...")
+                self._known_threads.clear()
                 async with websockets.connect(self.config.gateway_url) as ws:
                     self._ws = ws
                     await self._gateway_loop()
@@ -188,9 +191,7 @@ class DiscordChannel(BaseChannel):
                     data: dict[str, Any] = {}
                     if payload_json:
                         data["payload_json"] = json.dumps(payload_json)
-                    response = await self._http.post(
-                        url, headers=headers, files=files, data=data
-                    )
+                    response = await self._http.post(url, headers=headers, files=files, data=data)
                 if response.status_code == 429:
                     resp_data = response.json()
                     retry_after = float(resp_data.get("retry_after", 1.0))
@@ -227,27 +228,49 @@ class DiscordChannel(BaseChannel):
             if seq is not None:
                 self._seq = seq
 
-            if op == 10:
-                # HELLO: start heartbeat and identify
-                interval_ms = payload.get("heartbeat_interval", 45000)
-                await self._start_heartbeat(interval_ms / 1000)
-                await self._identify()
-            elif op == 0 and event_type == "READY":
-                logger.info("Discord gateway READY")
-                # Capture bot user ID for mention detection
-                user_data = payload.get("user") or {}
-                self._bot_user_id = user_data.get("id")
-                logger.info("Discord bot connected as user {}", self._bot_user_id)
-            elif op == 0 and event_type == "MESSAGE_CREATE":
-                await self._handle_message_create(payload)
-            elif op == 7:
-                # RECONNECT: exit loop to reconnect
-                logger.info("Discord gateway requested reconnect")
+            should_break = await self._dispatch_event(op, event_type, payload)
+            if should_break:
                 break
-            elif op == 9:
-                # INVALID_SESSION: reconnect
-                logger.warning("Discord gateway invalid session")
-                break
+
+    async def _dispatch_event(
+        self, op: int | None, event_type: str | None, payload: dict[str, Any]
+    ) -> bool:
+        """Dispatch a single gateway event. Returns True if the loop should break."""
+        if op == 10:
+            # HELLO: start heartbeat and identify
+            interval_ms = payload.get("heartbeat_interval", 45000)
+            await self._start_heartbeat(interval_ms / 1000)
+            await self._identify()
+        elif op == 0 and event_type == "READY":
+            logger.info("Discord gateway READY")
+            # Capture bot user ID for mention detection
+            user_data = payload.get("user") or {}
+            self._bot_user_id = user_data.get("id")
+            logger.info("Discord bot connected as user {}", self._bot_user_id)
+        elif op == 0 and event_type == "GUILD_CREATE":
+            for thread in payload.get("threads") or []:
+                tid = thread.get("id")
+                if tid:
+                    self._known_threads.add(str(tid))
+        elif op == 0 and event_type == "THREAD_CREATE":
+            tid = payload.get("id")
+            if tid:
+                self._known_threads.add(str(tid))
+        elif op == 0 and event_type == "THREAD_DELETE":
+            tid = payload.get("id")
+            if tid:
+                self._known_threads.discard(str(tid))
+        elif op == 0 and event_type == "MESSAGE_CREATE":
+            await self._handle_message_create(payload)
+        elif op == 7:
+            # RECONNECT: exit loop to reconnect
+            logger.info("Discord gateway requested reconnect")
+            return True
+        elif op == 9:
+            # INVALID_SESSION: reconnect
+            logger.warning("Discord gateway invalid session")
+            return True
+        return False
 
     async def _identify(self) -> None:
         """Send IDENTIFY payload."""
@@ -285,6 +308,38 @@ class DiscordChannel(BaseChannel):
 
         self._heartbeat_task = asyncio.create_task(heartbeat_loop())
 
+    async def _create_thread(self, channel_id: str, message_id: str, name: str) -> str | None:
+        """Create a thread on a message. Returns the thread channel ID or None on failure."""
+        if not self._http:
+            logger.warning("Discord HTTP client not initialized, cannot create thread")
+            return None
+        url = f"{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}/threads"
+        headers = {"Authorization": f"Bot {self.config.token}"}
+        body = {"name": name[:100], "auto_archive_duration": 4320}
+        for attempt in range(3):
+            try:
+                resp = await self._http.post(url, headers=headers, json=body)
+                if resp.status_code == 429:
+                    retry_after = float(resp.json().get("retry_after", 1.0))
+                    logger.warning(
+                        "Discord rate limited on thread create, retrying in {}s", retry_after
+                    )
+                    await asyncio.sleep(retry_after)
+                    continue
+                resp.raise_for_status()
+                thread_id = str(resp.json()["id"])
+                self._known_threads.add(thread_id)
+                logger.info("Discord thread created: {} in channel {}", thread_id, channel_id)
+                return thread_id
+            except Exception as e:
+                if attempt == 2:
+                    logger.error("Failed to create Discord thread: {}", e)
+                else:
+                    logger.debug("Discord thread create error (attempt {}): {}", attempt + 1, e)
+                    await asyncio.sleep(1)
+        logger.error("Failed to create Discord thread after 3 attempts (channel={})", channel_id)
+        return None
+
     async def _handle_message_create(self, payload: dict[str, Any]) -> None:
         """Handle incoming Discord messages."""
         author = payload.get("author") or {}
@@ -307,6 +362,29 @@ class DiscordChannel(BaseChannel):
             if not self._should_respond_in_group(payload, content):
                 return
 
+        # Determine chat_id and session_key based on thread logic
+        message_id = str(payload.get("id", ""))
+        chat_id = channel_id
+        session_key: str | None = None
+
+        if guild_id is not None and self.config.reply_in_thread:
+            if channel_id in self._known_threads:
+                # Already inside a thread — reply there directly
+                session_key = f"discord:{channel_id}"
+            else:
+                # Create a new thread on this message
+                thread_name = (content or "conversation")[:100]
+                thread_id = await self._create_thread(channel_id, message_id, thread_name)
+                if thread_id:
+                    chat_id = thread_id
+                    session_key = f"discord:{thread_id}"
+                else:
+                    logger.warning(
+                        "Thread creation failed for channel {} message {}, falling back to channel reply",
+                        channel_id,
+                        message_id,
+                    )
+
         content_parts = [content] if content else []
         media_paths: list[str] = []
         media_dir = get_media_dir("discord")
@@ -322,7 +400,9 @@ class DiscordChannel(BaseChannel):
                 continue
             try:
                 media_dir.mkdir(parents=True, exist_ok=True)
-                file_path = media_dir / f"{attachment.get('id', 'file')}_{filename.replace('/', '_')}"
+                file_path = (
+                    media_dir / f"{attachment.get('id', 'file')}_{filename.replace('/', '_')}"
+                )
                 resp = await self._http.get(url)
                 resp.raise_for_status()
                 file_path.write_bytes(resp.content)
@@ -334,18 +414,19 @@ class DiscordChannel(BaseChannel):
 
         reply_to = (payload.get("referenced_message") or {}).get("id")
 
-        await self._start_typing(channel_id)
+        await self._start_typing(chat_id)
 
         await self._handle_message(
             sender_id=sender_id,
-            chat_id=channel_id,
+            chat_id=chat_id,
             content="\n".join(p for p in content_parts if p) or "[empty message]",
             media=media_paths,
             metadata={
-                "message_id": str(payload.get("id", "")),
+                "message_id": message_id,
                 "guild_id": guild_id,
                 "reply_to": reply_to,
             },
+            session_key=session_key,
         )
 
     def _should_respond_in_group(self, payload: dict[str, Any], content: str) -> bool:
@@ -364,7 +445,9 @@ class DiscordChannel(BaseChannel):
                 # Also check content for mention format <@USER_ID>
                 if f"<@{self._bot_user_id}>" in content or f"<@!{self._bot_user_id}>" in content:
                     return True
-            logger.debug("Discord message in {} ignored (bot not mentioned)", payload.get("channel_id"))
+            logger.debug(
+                "Discord message in {} ignored (bot not mentioned)", payload.get("channel_id")
+            )
             return False
 
         return True
